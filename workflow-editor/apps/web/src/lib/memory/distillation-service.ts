@@ -148,26 +148,14 @@ Example output: ["User is traveling to SFO Feb 20-24 for a conference", "Prefers
 
 /**
  * Run distillation for all users who have daily artifacts.
+ * Note: Without a dedicated Convex query to list all unique userIds,
+ * this needs to be called per-user or have a Convex query added.
  */
 export async function distillAllUsers(): Promise<{
   usersProcessed: number;
   totalInsights: number;
   errors: string[];
 }> {
-  // In dev mode, just process the dev user
-  const { DEV_USER } = await import('@/lib/dev-user');
-  const userIds: string[] = [DEV_USER.id];
-  let totalInsights = 0;
-  const errors: string[] = [];
-
-  for (const userId of userIds) {
-    const outcome = await distillMemory(userId);
-    if (outcome.success) {
-      totalInsights += outcome.insightsAdded;
-    } else if (outcome.error) {
-      errors.push(`User ${userId}: ${outcome.error}`);
-    }
-  }
-
-  return { usersProcessed: userIds.length, totalInsights, errors };
+  console.warn('distillAllUsers: requires a Convex query to list all user IDs with daily artifacts. Not yet implemented.');
+  return { usersProcessed: 0, totalInsights: 0, errors: [] };
 }

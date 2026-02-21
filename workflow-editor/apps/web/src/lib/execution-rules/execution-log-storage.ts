@@ -1,24 +1,47 @@
 /**
- * In-memory storage for execution logs
+ * Convex storage for execution logs
  */
 
+import { convex, api } from '@/lib/convex';
 import type { ExecutionLogEntry, ExecutionLogStats } from './types';
+import type { Id } from '../../../convex/_generated/dataModel';
 
-/** In-memory store (use globalThis to survive Next.js dev-mode HMR) */
-const g = globalThis as unknown as { __executionLogs?: ExecutionLogEntry[] };
-if (!g.__executionLogs) g.__executionLogs = [];
-const logs = g.__executionLogs;
+function toISO(ts?: number | null): string {
+  return ts ? new Date(ts).toISOString() : new Date().toISOString();
+}
 
-function generateId(): string {
-  const timestamp = Date.now().toString(36);
-  const randomPart = Math.random().toString(36).substring(2, 15);
-  return `log_${timestamp}${randomPart}`;
+function mapDoc(doc: Record<string, unknown>): ExecutionLogEntry {
+  return {
+    id: doc._id as string,
+    ruleId: doc.ruleId as string,
+    ruleName: doc.ruleName as string,
+    userId: doc.userId as string,
+    triggerSlug: (doc.triggerSlug as string) || '',
+    status: doc.status as 'success' | 'failure' | 'partial',
+    stepsJson: (doc.stepsJson as ExecutionLogEntry['stepsJson']) || [],
+    outputText: (doc.outputText as string) || undefined,
+    errorText: (doc.errorText as string) || undefined,
+    durationMs: (doc.durationMs as number) || undefined,
+    createdAt: toISO(doc.createdAt as number),
+  };
 }
 
 export const executionLogStorage = {
   async create(log: Omit<ExecutionLogEntry, 'id' | 'createdAt'>): Promise<ExecutionLogEntry> {
-    const entry: ExecutionLogEntry = {
-      id: generateId(),
+    const id = await convex.mutation(api.executionLogs.create, {
+      ruleId: log.ruleId as Id<"execution_rules">,
+      ruleName: log.ruleName,
+      userId: log.userId,
+      triggerSlug: log.triggerSlug || undefined,
+      status: log.status,
+      stepsJson: log.stepsJson || [],
+      outputText: log.outputText || undefined,
+      errorText: log.errorText || undefined,
+      durationMs: log.durationMs || undefined,
+    });
+
+    return {
+      id: id as string,
       ruleId: log.ruleId,
       ruleName: log.ruleName,
       userId: log.userId,
@@ -30,80 +53,54 @@ export const executionLogStorage = {
       durationMs: log.durationMs,
       createdAt: new Date().toISOString(),
     };
-    logs.push(entry);
-    return entry;
   },
 
   async getByRuleId(ruleId: string, limit = 50, offset = 0): Promise<{ logs: ExecutionLogEntry[]; total: number }> {
-    const filtered = logs
-      .filter((l) => l.ruleId === ruleId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-
-    const total = filtered.length;
-    const paginated = filtered.slice(offset, offset + limit);
-
-    return { logs: paginated, total };
+    const docs = await convex.query(api.executionLogs.listByRule, {
+      ruleId: ruleId as Id<"execution_rules">,
+    });
+    const total = docs.length;
+    const sliced = docs.slice(offset, offset + limit);
+    return { logs: sliced.map(mapDoc), total };
   },
 
   async getByUserId(userId: string, limit = 50, offset = 0): Promise<{ logs: ExecutionLogEntry[]; total: number }> {
-    const filtered = logs
-      .filter((l) => l.userId === userId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-
-    const total = filtered.length;
-    const paginated = filtered.slice(offset, offset + limit);
-
-    return { logs: paginated, total };
+    const docs = await convex.query(api.executionLogs.list, { userId });
+    const total = docs.length;
+    const sliced = docs.slice(offset, offset + limit);
+    return { logs: sliced.map(mapDoc), total };
   },
 
   async getRecent(userId: string, limit = 10): Promise<ExecutionLogEntry[]> {
-    return logs
-      .filter((l) => l.userId === userId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-      .slice(0, limit);
+    const docs = await convex.query(api.executionLogs.list, { userId, limit });
+    return docs.map(mapDoc);
   },
 
-  async deleteOlderThan(days: number): Promise<number> {
-    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-    let deleted = 0;
-    for (let i = logs.length - 1; i >= 0; i--) {
-      if (new Date(logs[i].createdAt).getTime() < cutoff) {
-        logs.splice(i, 1);
-        deleted++;
-      }
-    }
-    return deleted;
+  async deleteOlderThan(_days: number): Promise<number> {
+    console.warn('TODO: implement deleteOlderThan in Convex');
+    return 0;
   },
 
   async getStats(userId: string): Promise<ExecutionLogStats> {
-    const userLogs = logs.filter((l) => l.userId === userId);
-    const totalRuns = userLogs.length;
-    const successCount = userLogs.filter((l) => l.status === 'success').length;
-    const durations = userLogs.filter((l) => l.durationMs != null).map((l) => l.durationMs!);
-    const avgDurationMs = durations.length > 0
-      ? Math.round(durations.reduce((sum, d) => sum + d, 0) / durations.length)
-      : 0;
-
+    const s = await convex.query(api.executionLogs.stats, { userId });
     return {
-      totalRuns,
-      successRate: totalRuns > 0 ? (successCount / totalRuns) * 100 : 0,
-      avgDurationMs,
+      totalRuns: s.total,
+      successRate: s.total > 0 ? (s.success / s.total) * 100 : 0,
+      avgDurationMs: Math.round(s.avgDuration),
     };
   },
 
   async getStatsByRuleId(ruleId: string): Promise<ExecutionLogStats> {
-    const ruleLogs = logs.filter((l) => l.ruleId === ruleId);
-    const totalRuns = ruleLogs.length;
-    const successCount = ruleLogs.filter((l) => l.status === 'success').length;
-    const durations = ruleLogs.filter((l) => l.durationMs != null).map((l) => l.durationMs!);
-    const avgDurationMs = durations.length > 0
-      ? Math.round(durations.reduce((sum, d) => sum + d, 0) / durations.length)
+    const { logs } = await this.getByRuleId(ruleId, 10000, 0);
+    const total = logs.length;
+    const success = logs.filter(l => l.status === 'success').length;
+    const avgMs = total > 0
+      ? logs.reduce((sum, l) => sum + (l.durationMs || 0), 0) / total
       : 0;
-
     return {
-      totalRuns,
-      successRate: totalRuns > 0 ? (successCount / totalRuns) * 100 : 0,
-      avgDurationMs,
+      totalRuns: total,
+      successRate: total > 0 ? (success / total) * 100 : 0,
+      avgDurationMs: Math.round(avgMs),
     };
   },
 };

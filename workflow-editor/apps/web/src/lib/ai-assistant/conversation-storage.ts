@@ -1,240 +1,166 @@
 /**
- * Conversation Storage Service
- *
- * In-memory storage for AI Assistant chat conversations.
- * Data resets on server restart.
+ * Convex storage for AI Assistant conversations
  */
 
-import { v4 as uuidv4 } from 'uuid';
+import { convex, api } from '@/lib/convex';
 import type {
   Conversation,
   AssistantMode,
   ChatMessage,
   ToolRouterMessage,
 } from './types';
+import type { Id } from '../../../convex/_generated/dataModel';
 
-/** In-memory stores (use globalThis to survive Next.js dev-mode HMR) */
-const g = globalThis as unknown as {
-  __conversations?: Map<string, Conversation & { userId: string; summarizedAt?: string }>;
-  __conversationMessages?: Map<string, (ToolRouterMessage & { conversationId: string })[]>;
-};
-if (!g.__conversations) g.__conversations = new Map();
-if (!g.__conversationMessages) g.__conversationMessages = new Map();
-const conversations = g.__conversations;
-const messages = g.__conversationMessages;
+function toISO(ts?: number | null): string {
+  return ts ? new Date(ts).toISOString() : new Date().toISOString();
+}
 
 /**
  * Generate a title from message content
  */
 function generateTitle(content: string): string {
   const cleaned = content.trim().replace(/\s+/g, ' ');
-  if (cleaned.length <= 40) {
-    return cleaned;
-  }
+  if (cleaned.length <= 40) return cleaned;
   return cleaned.substring(0, 40).trim() + '...';
 }
 
-/**
- * Conversation storage operations
- */
 export const conversationsStorage = {
-  /**
-   * Get all conversations for a user (with messages)
-   */
   async getByUserId(userId: string): Promise<Conversation[]> {
-    const userConvs = Array.from(conversations.values())
-      .filter((c) => c.userId === userId)
-      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    const convDocs = await convex.query(api.conversations.list, { userId });
 
-    return userConvs.map((conv) => {
-      const convMessages = messages.get(conv.id) || [];
-      const toolRouterMessages: ToolRouterMessage[] = convMessages
-        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-        .map(({ conversationId, ...msg }) => msg);
+    const conversations: Conversation[] = [];
+    for (const doc of convDocs) {
+      const msgDocs = await convex.query(api.conversations.getMessages, {
+        conversationId: doc._id as Id<"conversations">,
+      });
 
-      return {
-        id: conv.id,
-        title: conv.title,
-        mode: conv.mode,
+      const toolRouterMessages: ToolRouterMessage[] = msgDocs.map((m: any) => ({
+        id: m._id as string,
+        role: m.role,
+        content: m.content,
+        timestamp: toISO(m.createdAt),
+        toolCalls: m.metadata?.toolCalls,
+      }));
+
+      conversations.push({
+        id: doc._id as string,
+        title: (doc as any).title || 'New conversation',
+        mode: (doc as any).mode || 'chat',
+        createdAt: toISO((doc as any).createdAt),
+        updatedAt: toISO((doc as any).updatedAt),
         messages: [],
         toolRouterMessages,
-        createdAt: conv.createdAt,
-        updatedAt: conv.updatedAt,
-      };
-    });
+      });
+    }
+
+    return conversations;
   },
 
-  /**
-   * Get a specific conversation by ID
-   */
   async get(id: string): Promise<Conversation | null> {
-    const conv = conversations.get(id);
-    if (!conv) return null;
+    const doc = await convex.query(api.conversations.get, { id: id as Id<"conversations"> });
+    if (!doc) return null;
 
-    const convMessages = messages.get(id) || [];
-    const toolRouterMessages: ToolRouterMessage[] = convMessages
-      .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-      .map(({ conversationId, ...msg }) => msg);
+    const msgDocs = await convex.query(api.conversations.getMessages, {
+      conversationId: id as Id<"conversations">,
+    });
+
+    const toolRouterMessages: ToolRouterMessage[] = msgDocs.map((m: any) => ({
+      id: m._id as string,
+      role: m.role,
+      content: m.content,
+      timestamp: toISO(m.createdAt),
+      toolCalls: m.metadata?.toolCalls,
+    }));
 
     return {
-      id: conv.id,
-      title: conv.title,
-      mode: conv.mode,
+      id: doc._id as string,
+      title: (doc as any).title || 'New conversation',
+      mode: (doc as any).mode || 'chat',
+      createdAt: toISO((doc as any).createdAt),
+      updatedAt: toISO((doc as any).updatedAt),
       messages: [],
       toolRouterMessages,
-      createdAt: conv.createdAt,
-      updatedAt: conv.updatedAt,
     };
   },
 
-  /**
-   * Create a new conversation
-   */
   async create(userId: string, mode: AssistantMode): Promise<Conversation> {
-    const id = uuidv4();
-    const now = new Date().toISOString();
-
-    const conv = {
-      id,
+    const id = await convex.mutation(api.conversations.create, {
       userId,
       title: 'New conversation',
-      mode,
-      messages: [] as ChatMessage[],
-      toolRouterMessages: [] as ToolRouterMessage[],
-      createdAt: now,
-      updatedAt: now,
-    };
-
-    conversations.set(id, conv);
-    messages.set(id, []);
+    });
 
     return {
-      id,
+      id: id as string,
       title: 'New conversation',
       mode,
       messages: [],
       toolRouterMessages: [],
-      createdAt: now,
-      updatedAt: now,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     };
   },
 
-  /**
-   * Add a message to a conversation
-   */
   async addMessage(
     conversationId: string,
     message: ChatMessage | ToolRouterMessage,
-    mode: AssistantMode
+    _mode: AssistantMode
   ): Promise<void> {
-    const id = message.id || uuidv4();
-
     const toolMsg = message as ToolRouterMessage;
-    const storedMessage = {
-      id,
-      conversationId,
-      role: toolMsg.role,
+    await convex.mutation(api.conversations.sendMessage, {
+      conversationId: conversationId as Id<"conversations">,
+      role: toolMsg.role as 'user' | 'assistant' | 'system',
       content: toolMsg.content,
-      timestamp: toolMsg.timestamp,
-      toolCalls: toolMsg.toolCalls,
-    };
+      metadata: toolMsg.toolCalls ? { toolCalls: toolMsg.toolCalls } : undefined,
+    });
 
-    const convMessages = messages.get(conversationId);
-    if (convMessages) {
-      convMessages.push(storedMessage);
-    } else {
-      messages.set(conversationId, [storedMessage]);
-    }
-
-    // Update conversation title if it's the first user message
-    const allMessages = messages.get(conversationId) || [];
-    if (allMessages.length === 1 && message.role === 'user') {
-      const conv = conversations.get(conversationId);
-      if (conv) {
-        conv.title = generateTitle(message.content);
+    // Auto-title on first user message
+    if (message.role === 'user') {
+      const msgs = await convex.query(api.conversations.getMessages, {
+        conversationId: conversationId as Id<"conversations">,
+      });
+      if (msgs.length === 1) {
+        const title = generateTitle(message.content);
+        await convex.mutation(api.conversations.updateTitle, {
+          id: conversationId as Id<"conversations">,
+          title,
+        });
       }
     }
   },
 
-  /**
-   * Update conversation mode
-   */
-  async updateMode(id: string, mode: AssistantMode): Promise<void> {
-    const conv = conversations.get(id);
-    if (conv) {
-      conv.mode = mode;
-      conv.updatedAt = new Date().toISOString();
-    }
+  async updateMode(_id: string, _mode: AssistantMode): Promise<void> {
+    // Convex schema doesn't have mode field on conversations
+    console.warn('updateMode: mode field not in Convex schema, skipping');
   },
 
-  /**
-   * Rename a conversation
-   */
   async rename(id: string, title: string): Promise<void> {
-    const conv = conversations.get(id);
-    if (conv) {
-      conv.title = title;
-      conv.updatedAt = new Date().toISOString();
-    }
-  },
-
-  /**
-   * Delete a conversation
-   */
-  async delete(id: string): Promise<boolean> {
-    messages.delete(id);
-    return conversations.delete(id);
-  },
-
-  /**
-   * Find conversations that have been inactive for a given threshold
-   * and haven't been summarized yet
-   */
-  async findInactiveConversations(thresholdMs: number): Promise<Conversation[]> {
-    const cutoffTime = Date.now() - thresholdMs;
-
-    const inactive = Array.from(conversations.values())
-      .filter(
-        (c) =>
-          new Date(c.updatedAt).getTime() < cutoffTime &&
-          !c.summarizedAt
-      )
-      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
-      .slice(0, 50);
-
-    return inactive.map((conv) => {
-      const convMessages = messages.get(conv.id) || [];
-      const toolRouterMessages: ToolRouterMessage[] = convMessages
-        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
-        .map(({ conversationId, ...msg }) => msg);
-
-      return {
-        id: conv.id,
-        title: conv.title,
-        mode: conv.mode,
-        messages: [],
-        toolRouterMessages,
-        createdAt: conv.createdAt,
-        updatedAt: conv.updatedAt,
-      };
+    await convex.mutation(api.conversations.updateTitle, {
+      id: id as Id<"conversations">,
+      title,
     });
   },
 
-  /**
-   * Mark a conversation as summarized
-   */
-  async markAsSummarized(id: string): Promise<void> {
-    const conv = conversations.get(id);
-    if (conv) {
-      conv.summarizedAt = new Date().toISOString();
+  async delete(id: string): Promise<boolean> {
+    try {
+      await convex.mutation(api.conversations.remove, { id: id as Id<"conversations"> });
+      return true;
+    } catch {
+      return false;
     }
   },
 
-  /**
-   * Get the user ID for a conversation
-   */
+  async findInactiveConversations(_thresholdMs: number): Promise<Conversation[]> {
+    console.warn('TODO: implement findInactiveConversations in Convex');
+    return [];
+  },
+
+  async markAsSummarized(_id: string): Promise<void> {
+    console.warn('TODO: implement markAsSummarized in Convex');
+  },
+
   async getUserId(id: string): Promise<string | null> {
-    const conv = conversations.get(id);
-    return conv ? conv.userId : null;
+    const doc = await convex.query(api.conversations.get, { id: id as Id<"conversations"> });
+    if (!doc) return null;
+    return (doc as any).userId || null;
   },
 };

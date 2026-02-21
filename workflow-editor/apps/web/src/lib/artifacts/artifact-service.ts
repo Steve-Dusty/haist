@@ -1,10 +1,8 @@
 /**
- * Artifact Service
- *
- * In-memory CRUD operations for artifacts and artifact entries.
- * Data resets on server restart.
+ * Convex-backed Artifact Service
  */
 
+import { convex, api } from '@/lib/convex';
 import type {
   Artifact,
   ArtifactWithEntries,
@@ -16,90 +14,67 @@ import type {
   FindSimilarOptions,
   ArtifactSearchResult,
 } from './types';
+import type { Id } from '../../../convex/_generated/dataModel';
 
-/** In-memory stores (use globalThis to survive Next.js dev-mode HMR) */
-const g = globalThis as unknown as {
-  __artifacts?: Map<string, Artifact & { embedding?: number[] }>;
-  __artifactEntries?: Map<string, ArtifactEntry>;
-};
-if (!g.__artifacts) g.__artifacts = new Map();
-if (!g.__artifactEntries) g.__artifactEntries = new Map();
-const artifacts = g.__artifacts;
-const entries = g.__artifactEntries;
-
-/**
- * Generate unique ID
- */
-function generateId(prefix: string = ''): string {
-  const timestamp = Date.now().toString(36);
-  const randomPart = Math.random().toString(36).substring(2, 15);
-  return prefix ? `${prefix}_${timestamp}${randomPart}` : `c${timestamp}${randomPart}`;
+function toISO(ts?: number | null): string {
+  return ts ? new Date(ts).toISOString() : new Date().toISOString();
 }
 
-/**
- * Artifact storage operations
- */
+function mapArtifact(doc: Record<string, unknown>): Artifact {
+  return {
+    id: doc._id as string,
+    userId: doc.userId as string,
+    title: doc.title as string,
+    summary: (doc.summary as string) || null,
+    tags: (doc.tags as string[]) || [],
+    createdAt: toISO(doc.createdAt as number),
+    updatedAt: toISO(doc.updatedAt as number),
+  };
+}
+
+function mapEntry(doc: Record<string, unknown>): ArtifactEntry {
+  return {
+    id: doc._id as string,
+    artifactId: doc.artifactId as string,
+    workflowId: (doc.workflowId as string) || null,
+    workflowName: (doc.workflowName as string) || null,
+    content: doc.content as string,
+    source: doc.source as ArtifactEntrySource,
+    createdAt: toISO(doc.createdAt as number),
+  };
+}
+
 export const artifactService = {
-  /**
-   * Get all artifacts for a user
-   */
   async getByUserId(userId: string): Promise<Artifact[]> {
-    return Array.from(artifacts.values())
-      .filter((a) => a.userId === userId)
-      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
-      .map(({ embedding, ...rest }) => rest);
+    const docs = await convex.query(api.artifacts.list, { userId });
+    return docs.map(mapArtifact);
   },
 
-  /**
-   * Get a single artifact by ID
-   */
   async get(id: string): Promise<Artifact | undefined> {
-    const artifact = artifacts.get(id);
-    if (!artifact) return undefined;
-    const { embedding, ...rest } = artifact;
-    return rest;
+    const doc = await convex.query(api.artifacts.get, { id: id as Id<"artifacts"> });
+    if (!doc) return undefined;
+    return mapArtifact(doc);
   },
 
-  /**
-   * Get artifact with all its entries
-   */
   async getWithEntries(id: string): Promise<ArtifactWithEntries | undefined> {
-    const artifact = await this.get(id);
-    if (!artifact) return undefined;
-
-    const artifactEntries = Array.from(entries.values())
-      .filter((e) => e.artifactId === id)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-
-    return {
-      ...artifact,
-      entries: artifactEntries,
-    };
+    const result = await convex.query(api.artifacts.getWithEntries, { id: id as Id<"artifacts"> });
+    if (!result) return undefined;
+    const artifact = mapArtifact(result as any);
+    const entries = ((result as any).entries || []).map(mapEntry);
+    return { ...artifact, entries };
   },
 
-  /**
-   * Create a new artifact
-   */
   async create(params: CreateArtifactParams): Promise<Artifact> {
-    const id = generateId('art');
-    const now = new Date().toISOString();
-
-    const artifact: Artifact & { embedding?: number[] } = {
-      id,
+    const id = await convex.mutation(api.artifacts.create, {
       userId: params.userId,
       title: params.title,
-      summary: params.summary || null,
+      summary: params.summary || undefined,
       tags: params.tags || [],
-      createdAt: now,
-      updatedAt: now,
       embedding: params.embedding,
-    };
+    });
 
-    artifacts.set(id, artifact);
-
-    // Add first entry if provided
     if (params.firstEntry) {
-      await this.addEntry(id, {
+      await this.addEntry(id as string, {
         workflowId: params.firstEntry.workflowId,
         workflowName: params.firstEntry.workflowName,
         content: params.firstEntry.content,
@@ -107,134 +82,105 @@ export const artifactService = {
       });
     }
 
-    const { embedding, ...rest } = artifact;
-    return rest;
+    const created = await this.get(id as string);
+    if (!created) throw new Error('Failed to create artifact');
+    return created;
   },
 
-  /**
-   * Update an artifact
-   */
   async update(id: string, params: UpdateArtifactParams): Promise<Artifact | undefined> {
-    const artifact = artifacts.get(id);
-    if (!artifact) return undefined;
+    const fields: Record<string, unknown> = {};
+    if (params.title !== undefined) fields.title = params.title;
+    if (params.summary !== undefined) fields.summary = params.summary;
+    if (params.tags !== undefined) fields.tags = params.tags;
+    if (params.embedding !== undefined) fields.embedding = params.embedding;
 
-    if (params.title !== undefined) artifact.title = params.title;
-    if (params.summary !== undefined) artifact.summary = params.summary;
-    if (params.tags !== undefined) artifact.tags = params.tags;
-    if (params.embedding !== undefined) artifact.embedding = params.embedding;
-
-    artifact.updatedAt = new Date().toISOString();
-
-    const { embedding, ...rest } = artifact;
-    return rest;
-  },
-
-  /**
-   * Delete an artifact and all its entries
-   */
-  async delete(id: string): Promise<boolean> {
-    // Delete entries first
-    for (const [entryId, entry] of entries) {
-      if (entry.artifactId === id) {
-        entries.delete(entryId);
-      }
+    if (Object.keys(fields).length > 0) {
+      await convex.mutation(api.artifacts.update, {
+        id: id as Id<"artifacts">,
+        ...fields,
+      } as any);
     }
 
-    return artifacts.delete(id);
+    return this.get(id);
   },
 
-  /**
-   * Add an entry to an artifact
-   */
-  async addEntry(artifactId: string, params: AddEntryParams): Promise<ArtifactEntry> {
-    const id = generateId('ent');
-    const now = new Date().toISOString();
+  async delete(id: string): Promise<boolean> {
+    try {
+      await convex.mutation(api.artifacts.remove, { id: id as Id<"artifacts"> });
+      return true;
+    } catch {
+      return false;
+    }
+  },
 
-    const entry: ArtifactEntry = {
-      id,
+  async addEntry(artifactId: string, params: AddEntryParams): Promise<ArtifactEntry> {
+    const id = await convex.mutation(api.artifacts.addEntry, {
+      artifactId: artifactId as Id<"artifacts">,
+      workflowId: params.workflowId || undefined,
+      workflowName: params.workflowName || undefined,
+      content: params.content,
+      source: (params.source || 'workflow_output') as 'workflow_output' | 'manual' | 'ai_summary',
+    });
+
+    return {
+      id: id as string,
       artifactId,
       workflowId: params.workflowId || null,
       workflowName: params.workflowName || null,
       content: params.content,
       source: params.source || 'workflow_output',
-      createdAt: now,
+      createdAt: new Date().toISOString(),
     };
-
-    entries.set(id, entry);
-
-    // Update artifact's updatedAt timestamp
-    const artifact = artifacts.get(artifactId);
-    if (artifact) {
-      artifact.updatedAt = now;
-    }
-
-    return entry;
   },
 
-  /**
-   * Get entries for an artifact
-   */
-  async getEntries(artifactId: string, limit?: number): Promise<ArtifactEntry[]> {
-    const filtered = Array.from(entries.values())
-      .filter((e) => e.artifactId === artifactId)
-      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-
-    return limit ? filtered.slice(0, limit) : filtered;
+  async getEntries(artifactId: string, _limit?: number): Promise<ArtifactEntry[]> {
+    const result = await convex.query(api.artifacts.getWithEntries, { id: artifactId as Id<"artifacts"> });
+    if (!result) return [];
+    return ((result as any).entries || []).map(mapEntry);
   },
 
-  /**
-   * Delete an entry
-   */
-  async deleteEntry(entryId: string): Promise<boolean> {
-    return entries.delete(entryId);
+  async deleteEntry(_entryId: string): Promise<boolean> {
+    console.warn('TODO: implement deleteEntry in Convex');
+    return false;
   },
 
-  /**
-   * Find similar artifacts using vector similarity search
-   * In-memory version returns empty array (no vector search support)
-   */
   async findSimilar(options: FindSimilarOptions): Promise<ArtifactSearchResult[]> {
-    // No vector search in-memory -- return empty
-    return [];
+    try {
+      const results = await convex.action(api.artifacts.search, {
+        userId: options.userId,
+        embedding: options.embedding,
+        limit: options.limit || 5,
+      });
+      const out: ArtifactSearchResult[] = [];
+      for (const r of results as any[]) {
+        const art = await this.get(r._id as string);
+        if (art) {
+          out.push({ artifact: art, similarity: r._score });
+        }
+      }
+      return out;
+    } catch (error) {
+      console.warn('Vector search failed:', error);
+      return [];
+    }
   },
 
-  /**
-   * Search artifacts by text (fallback when vectors not available)
-   */
   async searchByText(userId: string, query: string, limit = 5): Promise<Artifact[]> {
-    const lowerQuery = query.toLowerCase();
-    return Array.from(artifacts.values())
-      .filter(
-        (a) =>
-          a.userId === userId &&
-          (a.title.toLowerCase().includes(lowerQuery) ||
-            (a.summary && a.summary.toLowerCase().includes(lowerQuery)))
-      )
-      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
-      .slice(0, limit)
-      .map(({ embedding, ...rest }) => rest);
+    const all = await this.getByUserId(userId);
+    const q = query.toLowerCase();
+    return all
+      .filter(a => a.title.toLowerCase().includes(q) || (a.summary?.toLowerCase().includes(q)))
+      .slice(0, limit);
   },
 
-  /**
-   * Update an entry's content
-   */
-  async updateEntry(entryId: string, content: string): Promise<ArtifactEntry> {
-    const entry = entries.get(entryId);
-    if (!entry) {
-      throw new Error('Entry not found');
-    }
-    entry.content = content;
-    return entry;
+  async updateEntry(_entryId: string, _content: string): Promise<ArtifactEntry> {
+    throw new Error('TODO: implement updateEntry in Convex');
   },
 
-  /**
-   * Update artifact embedding
-   */
   async updateEmbedding(id: string, embedding: number[]): Promise<void> {
-    const artifact = artifacts.get(id);
-    if (artifact) {
-      artifact.embedding = embedding;
-      artifact.updatedAt = new Date().toISOString();
-    }
+    await convex.mutation(api.artifacts.update, {
+      id: id as Id<"artifacts">,
+      embedding,
+    });
   },
 };
