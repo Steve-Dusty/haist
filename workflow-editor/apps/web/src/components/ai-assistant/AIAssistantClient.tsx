@@ -13,6 +13,8 @@ import {
   Code,
   Coffee,
   Lightbulb,
+  Mic,
+  Square,
 } from "lucide-react";
 import { useComposioStore, useUIStore } from "@workflow-editor/state";
 import { Notifications } from "@workflow-editor/ui";
@@ -367,6 +369,62 @@ function AIAssistantContent() {
   const [showChat, setShowChat] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [hoveredPrompt, setHoveredPrompt] = useState<string | null>(null);
+
+  // Voice recording state (landing page)
+  const [isRecordingLanding, setIsRecordingLanding] = useState(false);
+  const [isTranscribingLanding, setIsTranscribingLanding] = useState(false);
+  const mediaRecorderLandingRef = useRef<MediaRecorder | null>(null);
+  const audioChunksLandingRef = useRef<Blob[]>([]);
+
+  const startRecordingLanding = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus'
+          : 'audio/webm',
+      });
+      mediaRecorderLandingRef.current = mediaRecorder;
+      audioChunksLandingRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) audioChunksLandingRef.current.push(event.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach((track) => track.stop());
+        const audioBlob = new Blob(audioChunksLandingRef.current, { type: 'audio/webm' });
+        if (audioBlob.size === 0) return;
+
+        setIsTranscribingLanding(true);
+        try {
+          const formData = new FormData();
+          formData.append('audio', audioBlob, 'recording.webm');
+          const response = await fetch('/api/speech-to-text', { method: 'POST', body: formData });
+          if (response.ok) {
+            const { text } = await response.json();
+            if (text) setInputValue((prev) => (prev ? prev + ' ' + text : text));
+          }
+        } catch (err) {
+          console.error('STT error:', err);
+        } finally {
+          setIsTranscribingLanding(false);
+        }
+      };
+
+      mediaRecorder.start();
+      setIsRecordingLanding(true);
+    } catch (err) {
+      console.error('Mic access denied:', err);
+    }
+  };
+
+  const stopRecordingLanding = () => {
+    if (mediaRecorderLandingRef.current?.state === 'recording') {
+      mediaRecorderLandingRef.current.stop();
+      setIsRecordingLanding(false);
+    }
+  };
 
   // Mode toggle state - separate histories for each mode
   const [mode, setMode] = useState<AssistantMode>("tool-router");
@@ -1328,6 +1386,26 @@ function AIAssistantContent() {
                           <Plus className="w-5 h-5 text-muted-foreground" />
                         </button>
                       </div>
+                      <button
+                        type="button"
+                        onClick={isRecordingLanding ? stopRecordingLanding : startRecordingLanding}
+                        disabled={isLoading || isTranscribingLanding}
+                        className={clsx(
+                          'rounded-full p-2 transition-colors',
+                          isRecordingLanding
+                            ? 'bg-red-500 text-white hover:bg-red-600 animate-pulse'
+                            : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+                        )}
+                        aria-label={isRecordingLanding ? 'Stop recording' : 'Voice input'}
+                        title={isRecordingLanding ? 'Stop recording' : 'Voice input'}>
+                        {isTranscribingLanding ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : isRecordingLanding ? (
+                          <Square className="w-4 h-4" fill="currentColor" />
+                        ) : (
+                          <Mic className="w-4 h-4" />
+                        )}
+                      </button>
                       <button
                         type="submit"
                         disabled={!inputValue.trim() || isLoading}
