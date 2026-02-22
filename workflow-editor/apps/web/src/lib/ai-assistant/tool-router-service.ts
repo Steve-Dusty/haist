@@ -7,6 +7,7 @@
 import { Composio } from '@composio/core';
 import { OpenAIAgentsProvider } from '@composio/openai-agents';
 import { Agent, run } from '@openai/agents';
+import { getMinimaxModel, stripThinkTags } from '../minimax-model';
 import type {
   ToolRouterMessage,
   ToolRouterChatResponse,
@@ -298,7 +299,7 @@ RULES:
       const agent = new Agent({
         name: 'Personal Assistant',
         instructions: this.buildSystemPrompt(currentDateTime, userId),
-        model: 'gpt-5.2',
+        model: getMinimaxModel(),
         tools: sessionData.tools,
       });
 
@@ -331,7 +332,7 @@ RULES:
       }
 
       return {
-        message: result.finalOutput || '',
+        message: stripThinkTags(result.finalOutput || ''),
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
         sessionId: userId,
       };
@@ -450,7 +451,7 @@ RULES:
       const agent = new Agent({
         name: 'Personal Assistant',
         instructions: this.buildSystemPrompt(currentDateTime, userId),
-        model: 'gpt-5.2',
+        model: getMinimaxModel(),
         tools: sessionData.tools,
       });
 

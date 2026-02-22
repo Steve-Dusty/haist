@@ -9,6 +9,7 @@ import { NextRequest } from 'next/server';
 import { DEV_USER } from '@/lib/dev-user';
 import { toolRouterService } from '@/lib/ai-assistant/tool-router-service';
 import { findArtifactsWithConfidence, formatArtifactsForContext } from '@/lib/artifacts/smart-artifact-matcher';
+import { createThinkTagStreamFilter } from '@/lib/minimax-model';
 import type { ToolRouterChatRequest, InjectedArtifactInfo, ToolCallResult } from '@/lib/ai-assistant/types';
 
 /**
@@ -75,6 +76,9 @@ export async function POST(request: NextRequest) {
         const toolCallsMap = new Map<string, ToolCallResult>();
         
         try {
+          // Stateful filter to strip <think> tags across streaming chunks
+          const thinkFilter = createThinkTagStreamFilter();
+
           for await (const event of streamResult) {
             // Handle different types of stream events
             if (event.type === 'raw_model_stream_event') {
@@ -83,8 +87,11 @@ export async function POST(request: NextRequest) {
               if (modelEvent.data?.type === 'output_text_delta') {
                 const delta = modelEvent.data.delta;
                 if (delta && typeof delta === 'string') {
-                  const sseEvent = `event: text\ndata: ${JSON.stringify({ chunk: delta })}\n\n`;
-                  controller.enqueue(encoder.encode(sseEvent));
+                  const filtered = thinkFilter(delta);
+                  if (filtered) {
+                    const sseEvent = `event: text\ndata: ${JSON.stringify({ chunk: filtered })}\n\n`;
+                    controller.enqueue(encoder.encode(sseEvent));
+                  }
                 }
               }
             } else if (event.type === 'run_item_stream_event') {
